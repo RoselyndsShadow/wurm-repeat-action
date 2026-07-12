@@ -1,8 +1,11 @@
 # wurm-repeat-action
-A simple client-side mod for Wurm Unlimited that lets you repeat your last action with one command.
+A client-side mod for Wurm Unlimited that lets you repeat your last action with one command.
 
 ## Features
 - Repeat your last performed action
+- Discovers when an item is consumed, then searches your inventory for an item of the same type as the consumed item and activates it for the next use.
+- Has a memory for tile actions, and a memory for object actions. Dig, Repair, and Dig again with the same button
+- Has an ignore list
 - Works on any server (including offline/singleplayer)
 - Lightweight and easy to use
 
