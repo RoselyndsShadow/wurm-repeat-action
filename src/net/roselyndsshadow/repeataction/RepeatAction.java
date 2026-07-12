@@ -24,14 +24,20 @@ import java.util.logging.Logger;
 public class RepeatAction implements WurmClientMod, Initable, PreInitable {
 
     private static final Logger logger = Logger.getLogger(RepeatAction.class.getName());
-    public static final String VERSION = "1.2";
+    public static final String VERSION = "1.3";
 
     public static HeadsUpDisplay hud;
 
     private static short lastGroundActionId = -1;
     private static short lastItemActionId = -1;
+    private static short lastGroundObjectActionId = -1;
+
     private static String lastItemBaseName = null;
     private static boolean debug = false;
+
+    // Cached hover object (to handle timing issues)
+    private static Object lastHoveredObject = null;
+    private static long lastHoverUpdateTime = 0;
 
     private static final Set<Short> ignoredActions = new HashSet<>();
 
@@ -64,26 +70,63 @@ public class RepeatAction implements WurmClientMod, Initable, PreInitable {
         } catch (Exception ignored) {}
     }
 
+    // ==================== SAFE HOVERED OBJECT (with caching) ====================
+    private static Object getCurrentHoveredObject() {
+        try {
+            if (hud != null && hud.getWorld() != null) {
+                Object hovered = hud.getWorld().getCurrentHoveredObject();
+                if (hovered != null) {
+                    lastHoveredObject = hovered;
+                    lastHoverUpdateTime = System.currentTimeMillis();
+                    return hovered;
+                }
+            }
+            if (lastHoveredObject != null &&
+                    (System.currentTimeMillis() - lastHoverUpdateTime) < 1500) {
+                return lastHoveredObject;
+            }
+            return null;
+        } catch (Exception e) {
+            return lastHoveredObject;
+        }
+    }
+
+    private static boolean isHoveringGround() {
+        try {
+            Object hovered = getCurrentHoveredObject();
+            if (hovered == null) return true;
+            String name = hovered.getClass().getSimpleName().toLowerCase();
+            return name.contains("tilepicker") || name.contains("ground");
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    private static boolean isHoveringGroundObject() {
+        try {
+            Object hovered = getCurrentHoveredObject();
+            if (hovered == null) return false;
+
+            Class<?> clazz = hovered.getClass();
+            while (clazz != null) {
+                if (clazz.getSimpleName().toLowerCase().contains("grounditem")) {
+                    return true;
+                }
+                clazz = clazz.getSuperclass();
+            }
+            return false;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     // ==================== INVENTORY SEARCH ====================
     private static InventoryMetaItem findItemInInventory(String searchTerm) {
         if (hud == null || hud.getWorld() == null || searchTerm == null || searchTerm.isEmpty()) return null;
 
         try {
             InventoryMetaItem root = hud.getWorld().getInventoryManager().getPlayerInventory().getRootItem();
-            if (debug) debugLog("=== INVENTORY SEARCH START ===");
-            if (debug) debugLog("Looking for: \"" + searchTerm + "\"");
-
-            InventoryMetaItem result = searchInventory(root, searchTerm.toLowerCase());
-
-            if (debug) {
-                if (result != null) {
-                    debugLog("MATCH FOUND → Base: \"" + result.getBaseName() + "\" | Display: \"" + result.getDisplayName() + "\"");
-                } else {
-                    debugLog("NO MATCH FOUND");
-                }
-                debugLog("=== INVENTORY SEARCH END ===");
-            }
-            return result;
+            return searchInventory(root, searchTerm.toLowerCase());
         } catch (Exception e) {
             if (debug) debugLog("Search error: " + e.getMessage());
             return null;
@@ -161,48 +204,30 @@ public class RepeatAction implements WurmClientMod, Initable, PreInitable {
                                 if (nextItem != null) {
                                     boolean success = false;
 
-                                    // Try 1
                                     try {
                                         java.lang.reflect.Method m = HeadsUpDisplay.class.getMethod("setActiveToolItem", InventoryMetaItem.class);
                                         m.setAccessible(true);
                                         m.invoke(hud, nextItem);
                                         success = true;
-                                        debugLog("AUTO-ACTIVATED (try 1)");
-                                    } catch (Exception e) {
-                                        debugLog("Try 1 failed: " + e.getMessage());
-                                    }
+                                    } catch (Exception ignored) {}
 
-                                    // Try 2
                                     if (!success) {
                                         try {
                                             java.lang.reflect.Method m = hud.getClass().getMethod("setActiveToolItem", InventoryMetaItem.class);
                                             m.setAccessible(true);
                                             m.invoke(hud, nextItem);
                                             success = true;
-                                            debugLog("AUTO-ACTIVATED (try 2)");
-                                        } catch (Exception e) {
-                                            debugLog("Try 2 failed: " + e.getMessage());
-                                        }
+                                        } catch (Exception ignored) {}
                                     }
 
-                                    // Try 3
                                     if (!success) {
                                         try {
                                             java.lang.reflect.Method m = HeadsUpDisplay.class.getDeclaredMethod("setActiveToolItem", InventoryMetaItem.class);
                                             m.setAccessible(true);
                                             m.invoke(hud, nextItem);
                                             success = true;
-                                            debugLog("AUTO-ACTIVATED (try 3)");
-                                        } catch (Exception e) {
-                                            debugLog("Try 3 failed: " + e.getMessage());
-                                        }
+                                        } catch (Exception ignored) {}
                                     }
-
-                                    if (!success) {
-                                        debugLog("ALL ACTIVATION ATTEMPTS FAILED");
-                                    }
-                                } else {
-                                    debugLog("No matching item found");
                                 }
                             }
                         } catch (Exception e) {
@@ -225,40 +250,26 @@ public class RepeatAction implements WurmClientMod, Initable, PreInitable {
             short actionToRepeat = -1;
             String memoryUsed = "";
 
-            if (isHoveringGround()) {
+            boolean currentlyHoveringGroundObject = isHoveringGroundObject();
+            boolean currentlyHoveringGround = isHoveringGround();
+
+            if (currentlyHoveringGroundObject && lastGroundObjectActionId > 0) {
+                // Hovering a ground object (felled tree, etc.) → use Ground Object memory
+                actionToRepeat = lastGroundObjectActionId;
+                memoryUsed = "Ground Object";
+            }
+            else if (currentlyHoveringGround) {
+                // Hovering normal ground → use Ground memory
                 actionToRepeat = lastGroundActionId;
                 memoryUsed = "Ground";
-                if (actionToRepeat <= 0) {
+            }
+            else {
+                // Not clearly hovering ground or a ground object
+                // If we have an active tool and a recorded item action, prefer item memory
+                if (lastItemBaseName != null && lastItemActionId > 0) {
                     actionToRepeat = lastItemActionId;
-                    memoryUsed = "Item (fallback)";
-                }
-            } else {
-                memoryUsed = "Item";
-
-                if (lastItemBaseName != null) {
-                    InventoryMetaItem matchingItem = findItemInInventory(lastItemBaseName);
-                    if (matchingItem != null) {
-                        try {
-                            java.lang.reflect.Method activate =
-                                    HeadsUpDisplay.class.getMethod("setActiveToolItem", InventoryMetaItem.class);
-                            activate.setAccessible(true);
-                            activate.invoke(hud, matchingItem);
-
-                            PlayerAction pa = new PlayerAction(lastItemActionId, PlayerAction.ANYTHING, "", false);
-                            hud.sendAction(pa, matchingItem.getId());
-
-                            String msg = "Repeated using matching item from inventory";
-                            log(msg);
-                            if (hud != null) hud.consoleOutput(">>> " + msg);
-                            return true;
-                        } catch (Exception e) {
-                            debugLog("Smart repeat activation failed: " + e.getMessage());
-                        }
-                    }
-                }
-
-                actionToRepeat = lastItemActionId;
-                if (actionToRepeat <= 0) {
+                    memoryUsed = "Item";
+                } else {
                     actionToRepeat = lastGroundActionId;
                     memoryUsed = "Ground (fallback)";
                 }
@@ -296,27 +307,30 @@ public class RepeatAction implements WurmClientMod, Initable, PreInitable {
         return false;
     }
 
-    private static boolean isHoveringGround() {
-        try {
-            if (hud == null || hud.getWorld() == null) return true;
-            Object hovered = hud.getWorld().getCurrentHoveredObject();
-            if (hovered == null) return false;
-            String name = hovered.getClass().getSimpleName().toLowerCase();
-            return name.contains("tilepicker") || name.contains("ground");
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
     public static void recordAction(PlayerAction action) {
         try {
             short actionId = action.getId();
             if (actionId <= 0 || ignoredActions.contains(actionId)) return;
 
             boolean onGround = isHoveringGround();
-            debugLog("ACTION RECORDED → ID: " + actionId + " | Ground: " + onGround);
+            boolean onGroundObject = isHoveringGroundObject();
 
-            if (onGround) {
+            // Actions that should always be treated as item/tool actions
+            boolean isItemAction = (actionId == 162); // Repair (add more here if needed, e.g. improve)
+
+            if (debug) {
+                Object hovered = getCurrentHoveredObject();
+                String hoveredClass = (hovered != null) ? hovered.getClass().getSimpleName() : "null";
+                debugLog("ACTION RECORDED → ID: " + actionId +
+                        " | Ground: " + onGround +
+                        " | GroundObject: " + onGroundObject +
+                        " | HoveredClass: " + hoveredClass +
+                        (isItemAction ? " | Forced Item Action" : ""));
+            }
+
+            if (onGroundObject && !isItemAction) {
+                lastGroundObjectActionId = actionId;
+            } else if (onGround && !isItemAction) {
                 lastGroundActionId = actionId;
             } else {
                 lastItemActionId = actionId;
@@ -328,21 +342,24 @@ public class RepeatAction implements WurmClientMod, Initable, PreInitable {
 
     private static void loadIgnoreList() {
         ignoredActions.clear();
+
         File configFile = new File("mods/repeataction.properties");
         if (!configFile.exists()) return;
 
         try (FileInputStream fis = new FileInputStream(configFile)) {
             Properties props = new Properties();
             props.load(fis);
+
             String ignoreList = props.getProperty("ignoreActions", "");
             for (String idStr : ignoreList.split(",")) {
                 try {
                     ignoredActions.add(Short.parseShort(idStr.trim()));
                 } catch (NumberFormatException ignored) {}
             }
+
             log(">>> Ignore list loaded (" + ignoredActions.size() + " actions)");
         } catch (Exception e) {
-            log("WARNING: Could not load ignore list");
+            log("WARNING: Could not load properties file");
         }
     }
 
