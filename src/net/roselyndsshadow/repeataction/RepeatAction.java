@@ -24,20 +24,18 @@ import java.util.logging.Logger;
 public class RepeatAction implements WurmClientMod, Initable, PreInitable {
 
     private static final Logger logger = Logger.getLogger(RepeatAction.class.getName());
-    public static final String VERSION = "1.3";
+    public static final String VERSION = "1.4";
 
     public static HeadsUpDisplay hud;
 
     private static short lastGroundActionId = -1;
     private static short lastItemActionId = -1;
     private static short lastGroundObjectActionId = -1;
-
     private static String lastItemBaseName = null;
     private static boolean debug = false;
 
     // Cached hover object (to handle timing issues)
     private static Object lastHoveredObject = null;
-    private static long lastHoverUpdateTime = 0;
 
     private static final Set<Short> ignoredActions = new HashSet<>();
 
@@ -74,19 +72,20 @@ public class RepeatAction implements WurmClientMod, Initable, PreInitable {
     private static Object getCurrentHoveredObject() {
         try {
             if (hud != null && hud.getWorld() != null) {
-                Object hovered = hud.getWorld().getCurrentHoveredObject();
-                if (hovered != null) {
-                    lastHoveredObject = hovered;
-                    lastHoverUpdateTime = System.currentTimeMillis();
-                    return hovered;
+                Object fresh = hud.getWorld().getCurrentHoveredObject();
+
+                if (fresh != null) {
+                    // Fresh call succeeded → trust it and update memory
+                    lastHoveredObject = fresh;
+                    return fresh;
                 }
             }
-            if (lastHoveredObject != null &&
-                    (System.currentTimeMillis() - lastHoverUpdateTime) < 1500) {
-                return lastHoveredObject;
-            }
-            return null;
+
+            // Fresh call returned null (or failed) → stick with what we had before
+            return lastHoveredObject;
+
         } catch (Exception e) {
+            // On any error, fall back to last known hover
             return lastHoveredObject;
         }
     }
@@ -95,8 +94,15 @@ public class RepeatAction implements WurmClientMod, Initable, PreInitable {
         try {
             Object hovered = getCurrentHoveredObject();
             if (hovered == null) return true;
+
             String name = hovered.getClass().getSimpleName().toLowerCase();
-            return name.contains("tilepicker") || name.contains("ground");
+
+            // Treat every kind of picker as ground (surface, cave walls, ceiling, etc.)
+            if (name.contains("picker")) {
+                return true;
+            }
+
+            return name.contains("ground") || name.contains("tile");
         } catch (Exception e) {
             return true;
         }
@@ -244,34 +250,37 @@ public class RepeatAction implements WurmClientMod, Initable, PreInitable {
 
     // ==================== COMMANDS ====================
     public static boolean handleInput(final String cmd, final String[] data) {
+
         String cleanCmd = cmd.startsWith("/") ? cmd.substring(1) : cmd;
 
         if (cleanCmd.equalsIgnoreCase("repeataction")) {
+
             short actionToRepeat = -1;
             String memoryUsed = "";
 
-            boolean currentlyHoveringGroundObject = isHoveringGroundObject();
-            boolean currentlyHoveringGround = isHoveringGround();
+            boolean hoveringGroundObject = isHoveringGroundObject();
+            boolean hoveringGround       = isHoveringGround();           // includes all pickers
 
-            if (currentlyHoveringGroundObject && lastGroundObjectActionId > 0) {
-                // Hovering a ground object (felled tree, etc.) → use Ground Object memory
+            if (hoveringGroundObject && lastGroundObjectActionId > 0) {
                 actionToRepeat = lastGroundObjectActionId;
                 memoryUsed = "Ground Object";
-            }
-            else if (currentlyHoveringGround) {
-                // Hovering normal ground → use Ground memory
+
+            } else if (hoveringGround && lastGroundActionId > 0) {
                 actionToRepeat = lastGroundActionId;
                 memoryUsed = "Ground";
-            }
-            else {
-                // Not clearly hovering ground or a ground object
-                // If we have an active tool and a recorded item action, prefer item memory
-                if (lastItemBaseName != null && lastItemActionId > 0) {
-                    actionToRepeat = lastItemActionId;
-                    memoryUsed = "Item";
-                } else {
+
+            } else if (lastItemActionId > 0) {
+                actionToRepeat = lastItemActionId;
+                memoryUsed = "Item";
+
+            } else {
+                // Final fallback
+                if (lastGroundActionId > 0) {
                     actionToRepeat = lastGroundActionId;
                     memoryUsed = "Ground (fallback)";
+                } else if (lastGroundObjectActionId > 0) {
+                    actionToRepeat = lastGroundObjectActionId;
+                    memoryUsed = "Ground Object (fallback)";
                 }
             }
 
@@ -285,9 +294,11 @@ public class RepeatAction implements WurmClientMod, Initable, PreInitable {
             try {
                 PlayerAction action = new PlayerAction(actionToRepeat, PlayerAction.ANYTHING, "", false);
                 hud.getWorld().sendHoveredAction(action);
+
                 String msg = "Repeated action ID: " + actionToRepeat + " (" + memoryUsed + ")";
                 log(msg);
                 if (hud != null) hud.consoleOutput(">>> " + msg);
+
             } catch (Exception e) {
                 String msg = "Failed to repeat action.";
                 log(msg);
@@ -298,7 +309,9 @@ public class RepeatAction implements WurmClientMod, Initable, PreInitable {
 
         if (cleanCmd.equalsIgnoreCase("repeataction_debug")) {
             debug = !debug;
-            String msg = debug ? "Debug mode ENABLED" : "Debug mode DISABLED";
+            String msg = debug
+                    ? "Debug mode ENABLED (actions will be logged)"
+                    : "Debug mode DISABLED";
             log(msg);
             if (hud != null) hud.consoleOutput(">>> " + msg);
             return true;
