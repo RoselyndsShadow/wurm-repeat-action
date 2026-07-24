@@ -24,7 +24,7 @@ import java.util.logging.Logger;
 public class RepeatAction implements WurmClientMod, Initable, PreInitable {
 
     private static final Logger logger = Logger.getLogger(RepeatAction.class.getName());
-    public static final String VERSION = "1.5";
+    public static final String VERSION = "1.6";
 
     public static HeadsUpDisplay hud;
 
@@ -193,50 +193,97 @@ public class RepeatAction implements WurmClientMod, Initable, PreInitable {
                 inventoryRoot = root;
             }
 
-            return searchInventory(inventoryRoot, searchTerm.toLowerCase().trim());
+            return searchInventoryBest(inventoryRoot, searchTerm.toLowerCase().trim());
         } catch (Exception e) {
             if (debug) debugLog("Search error: " + e.getMessage());
             return null;
         }
     }
 
-    private static InventoryMetaItem searchInventory(InventoryMetaItem item, String term) {
-        try {
-            String base = item.getBaseName() != null ? item.getBaseName().toLowerCase().trim() : "";
-            String display = item.getDisplayName() != null ? item.getDisplayName().toLowerCase().trim() : "";
+    /**
+     * Score how well an item name matches the search term.
+     * Higher = better. 0 = no match.
+     *
+     * Priority:
+     *   4  exact display or base match
+     *   3  display/base starts with full term, or full term starts with display/base
+     *   2  display/base contains the full term (or vice-versa for substantial names)
+     *   1  core-type match only (everything before first comma) — last resort
+     */
+    private static int matchScore(String display, String base, String term, String coreType) {
+        if (display.isEmpty() && base.isEmpty()) return 0;
 
-            // Never match empty / null names (prevents bogus hits on internal nodes)
-            if (!base.isEmpty() || !display.isEmpty()) {
-                // Extract core type name (everything before first comma) for smarter same-type matching.
-                // e.g. "butchering knife, iron" → "butchering knife"
-                //      "string of cloth, cotton" → "string of cloth"
-                //      "pickaxe, iron (Holy Pick!)" → "pickaxe"
-                String coreType = term;
-                int comma = term.indexOf(',');
-                if (comma > 0) {
-                    coreType = term.substring(0, comma).trim();
-                }
+        if (display.equals(term) || base.equals(term)) return 4;
 
-                // Match if:
-                // - full names match / contain each other, OR
-                // - the item's name contains the core type (most useful for finding next identical tool)
-                boolean nameContainsTerm = display.contains(term) || base.contains(term);
-                boolean termContainsName = (base.length() > 2 && term.contains(base)) ||
-                                           (display.length() > 2 && term.contains(display));
-                boolean coreTypeMatch = (coreType.length() > 2) &&
-                        (display.contains(coreType) || base.contains(coreType));
-
-                if (nameContainsTerm || termContainsName || coreTypeMatch) {
-                    return item;
-                }
-            }
-        } catch (Exception ignored) {}
-
-        for (InventoryMetaItem child : item.getChildren()) {
-            InventoryMetaItem found = searchInventory(child, term);
-            if (found != null) return found;
+        if ((!display.isEmpty() && (display.startsWith(term) || term.startsWith(display))) ||
+            (!base.isEmpty() && (base.startsWith(term) || term.startsWith(base)))) {
+            return 3;
         }
-        return null;
+
+        if (display.contains(term) || base.contains(term) ||
+            (base.length() > 2 && term.contains(base)) ||
+            (display.length() > 2 && term.contains(display))) {
+            return 2;
+        }
+
+        if (coreType.length() > 2 &&
+            (display.contains(coreType) || base.contains(coreType))) {
+            return 1;
+        }
+
+        return 0;
+    }
+
+    private static float getItemQuality(InventoryMetaItem item) {
+        try {
+            // InventoryMetaItem.getQuality() returns the QL as float
+            return item.getQuality();
+        } catch (Exception e) {
+            return Float.MAX_VALUE; // unknown → treat as highest so real QLs win
+        }
+    }
+
+    private static InventoryMetaItem searchInventoryBest(InventoryMetaItem root, String term) {
+        String coreType = term;
+        int comma = term.indexOf(',');
+        if (comma > 0) {
+            coreType = term.substring(0, comma).trim();
+        }
+
+        InventoryMetaItem best = null;
+        int bestScore = 0;
+        float bestQl = Float.MAX_VALUE;
+
+        // Iterative stack-based walk so we can score every candidate
+        java.util.ArrayDeque<InventoryMetaItem> stack = new java.util.ArrayDeque<>();
+        stack.push(root);
+
+        while (!stack.isEmpty()) {
+            InventoryMetaItem item = stack.pop();
+            try {
+                String base = item.getBaseName() != null ? item.getBaseName().toLowerCase().trim() : "";
+                String display = item.getDisplayName() != null ? item.getDisplayName().toLowerCase().trim() : "";
+
+                int score = matchScore(display, base, term, coreType);
+                if (score > 0) {
+                    float ql = getItemQuality(item);
+                    // Prefer higher name-match score; on a tie pick the lowest QL
+                    if (score > bestScore || (score == bestScore && ql < bestQl)) {
+                        bestScore = score;
+                        bestQl = ql;
+                        best = item;
+                    }
+                }
+            } catch (Exception ignored) {}
+
+            try {
+                for (InventoryMetaItem child : item.getChildren()) {
+                    stack.push(child);
+                }
+            } catch (Exception ignored) {}
+        }
+
+        return best;
     }
 
     // ==================== HOOKS ====================
@@ -257,10 +304,15 @@ public class RepeatAction implements WurmClientMod, Initable, PreInitable {
                                         try { name = item.getBaseName(); } catch (Exception ignored) {}
                                     }
                                     if (name != null && !name.isEmpty()) {
-                                        // Tool changed → drop the old hover cache so a previous
-                                        // GroundItem (e.g. a log) cannot mis-classify the next
-                                        // tile action (e.g. plant) as GroundObject.
-                                        lastHoveredObject = null;
+                                        // Tool actually changed (not just re-activated the same one)
+                                        // → wipe hover cache AND all three action memories so a
+                                        // previous spell / chop / etc. cannot leak into the new tool.
+                                        if (lastItemBaseName == null || !lastItemBaseName.equals(name)) {
+                                            lastHoveredObject = null;
+                                            lastGroundActionId = -1;
+                                            lastGroundObjectActionId = -1;
+                                            lastItemActionId = -1;
+                                        }
 
                                         lastItemBaseName = name;
                                         debugLog("ITEM ACTIVATED → \"" + name + "\"");
